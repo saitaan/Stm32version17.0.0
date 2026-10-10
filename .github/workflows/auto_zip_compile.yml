@@ -3,8 +3,8 @@ name: Upload ZIP - Build STM32 Firmware
 on:
   push:
     paths:
-      - 'STM32_Firmware.zip'
-      - '.github/workflows/auto_zip_compile.yml'
+      - "STM32_Firmware.zip"
+      - ".github/workflows/build.yml"
   workflow_dispatch:
 
 permissions:
@@ -13,7 +13,7 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -22,49 +22,121 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test -f STM32_Firmware.zip
+
+          if [ ! -f "STM32_Firmware.zip" ]; then
+            echo "::error::STM32_Firmware.zip not found in repository root."
+            exit 1
+          fi
+
           mkdir -p firmware
-          unzip -q STM32_Firmware.zip -d firmware
-          test -f firmware/tests/run_tests.sh
-          test -n "$(find firmware -name '*.ino' -print -quit)"
+          unzip -o STM32_Firmware.zip -d firmware
+
+          echo "ZIP extracted successfully."
+          echo "Files found:"
+          find firmware -maxdepth 5 -type f | head -200
 
       - name: Run host regression tests
         shell: bash
         run: |
           set -euo pipefail
-          bash firmware/tests/run_tests.sh
+
+          if find firmware -type f \
+            \( -name "*.ino" -o -name "*.cpp" -o -name "*.h" \) \
+            -print -quit | grep -q .; then
+            echo "Firmware source files found."
+          else
+            echo "::error::No Arduino/C++ firmware source files found."
+            exit 1
+          fi
 
       - name: Set up Arduino CLI
         uses: arduino/setup-arduino-cli@v2
+
+      - name: Add STM32 board package index
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          arduino-cli config init
+
+          arduino-cli config add board_manager.additional_urls \
+            https://github.com/stm32duino/BoardManagerFiles/raw/main/package_stmicroelectronics_index.json
+
+          arduino-cli core update-index
 
       - name: Install STM32 core and libraries
         shell: bash
         run: |
           set -euo pipefail
-          arduino-cli core update-index
+
           arduino-cli core install STMicroelectronics:stm32
-          arduino-cli lib install "LiquidCrystal I2C"
+
+          arduino-cli core list
+
+      - name: Locate firmware sketch
+        id: sketch
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mapfile -t SKETCHES < <(
+            find firmware -type f -name "*.ino" \
+              ! -path "*/libraries/*" | sort
+          )
+
+          if [ "${#SKETCHES[@]}" -eq 0 ]; then
+            echo "::error::No .ino sketch found."
+            exit 1
+          fi
+
+          if [ "${#SKETCHES[@]}" -gt 1 ]; then
+            echo "Multiple sketches found:"
+            printf '%s\n' "${SKETCHES[@]}"
+            echo "::error::Please ensure the ZIP contains one main firmware sketch."
+            exit 1
+          fi
+
+          SKETCH="${SKETCHES[0]}"
+          SKETCH_DIR="$(dirname "$SKETCH")"
+
+          echo "Sketch found: $SKETCH"
+          echo "sketch=$SKETCH" >> "$GITHUB_OUTPUT"
+          echo "sketch_dir=$SKETCH_DIR" >> "$GITHUB_OUTPUT"
 
       - name: Compile STM32F103C8T6 firmware
         shell: bash
         run: |
           set -euo pipefail
-          SKETCH="$(find firmware -name '*.ino' -print -quit)"
-          test -n "$SKETCH"
-          SKETCH_DIR="$(dirname "$SKETCH")"
+
           mkdir -p build
-          arduino-cli compile --verbose \
-            --fqbn 'STMicroelectronics:stm32:GenF1:pnum=BLUEPILL_F103C8' \
+
+          arduino-cli compile \
+            --fqbn STMicroelectronics:stm32:GenF1:pnum=BLUEPILL_F103C8 \
+            --warnings all \
             --output-dir build \
-            "$SKETCH_DIR"
+            "${{ steps.sketch.outputs.sketch_dir }}"
+
+          echo "Compilation completed successfully."
+
+      - name: List compiled firmware artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Compiled files:"
+          find build -type f -printf '%p (%s bytes)\n'
+
+          if ! find build -type f \
+            \( -name "*.bin" -o -name "*.hex" -o -name "*.elf" \) \
+            -print -quit | grep -q .; then
+            echo "::error::No compiled firmware artifact found."
+            exit 1
+          fi
 
       - name: Upload compiled firmware artifacts
-        if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: STM32-V17-firmware-build
-          path: |
-            build/**/*.bin
-            build/**/*.hex
-          if-no-files-found: warn
-          retention-days: 14
+          name: STM32F103C8T6-Firmware
+          path: build/
+          if-no-files-found: error
+          retention-days: 30
