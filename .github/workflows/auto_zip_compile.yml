@@ -1,10 +1,12 @@
-name: Upload ZIP - Build STM32 Firmware
+name: Auto Unzip & Compile STM32 Firmware
 
 on:
   push:
     paths:
-      - "STM32_Firmware.zip"
-      - ".github/workflows/auto_zip_compile.yml"
+      - '**.zip'
+      - '.github/workflows/**'
+      - '**.ino'
+    branches: [ main, master ]
   workflow_dispatch:
 
 permissions:
@@ -12,30 +14,131 @@ permissions:
 
 jobs:
   build:
+    name: ⚡ Unzip & Build STM32 Firmware
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repository
+      - name: 📥 Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Set up Arduino CLI
+      - name: 📦 Auto Detect & Unzip ZIP Archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Checking for uploaded ZIP archive..."
+
+          ZIP_FILE="$(find . -maxdepth 2 -type f -name '*.zip' \
+            ! -path './.git/*' | head -n 1 || true)"
+
+          if [ -n "$ZIP_FILE" ]; then
+            echo "Found ZIP file: $ZIP_FILE"
+            unzip -o "$ZIP_FILE" -d extracted-firmware
+            echo "Extraction completed."
+          else
+            echo "No ZIP file found; checking repository for an existing sketch."
+          fi
+
+          INO_FILE="$(find . -type f -name '*.ino' \
+            ! -path './.git/*' \
+            ! -path './extracted-firmware/.git/*' | head -n 1 || true)"
+
+          if [ -z "$INO_FILE" ]; then
+            echo "::error::No .ino firmware file found."
+            exit 1
+          fi
+
+          echo "Found firmware sketch: $INO_FILE"
+          echo "SKETCH_DIR=$(dirname "$INO_FILE")" >> "$GITHUB_ENV"
+
+      - name: 🛠️ Setup Arduino CLI
         uses: arduino/setup-arduino-cli@v2
 
-      - name: Initialize Arduino CLI
+      - name: 📦 Install STM32 Core & LCD Library
         shell: bash
         run: |
           set -euo pipefail
+
+          STM32_INDEX="https://github.com/stm32duino/BoardManagerFiles/raw/main/package_stmicroelectronics_index.json"
+
           arduino-cli config init
+          arduino-cli config add board_manager.additional_urls "$STM32_INDEX"
 
-      - name: Register STM32 Board Package
+          # Update indexes with the STM32 package index explicitly supplied.
+          arduino-cli core update-index --additional-urls "$STM32_INDEX"
+          arduino-cli lib update-index
+
+          echo "Checking whether STM32 platform is visible..."
+          arduino-cli core search stm32 --additional-urls "$STM32_INDEX"
+
+          echo "Installing STM32 core..."
+          arduino-cli core install STMicroelectronics:stm32 \
+            --additional-urls "$STM32_INDEX"
+
+          echo "Installing LCD library..."
+          arduino-cli lib install "LiquidCrystal I2C"
+
+          arduino-cli core list
+          arduino-cli lib list
+
+      - name: ⚡ Compile STM32F103C8T6 Firmware
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p build
+          echo "Compiling sketch in $SKETCH_DIR for STM32 Blue Pill..."
+
+          arduino-cli compile \
+            --verbose \
+            --fqbn STMicroelectronics:stm32:GenF1:pnum=BLUEPILL_F103C8 \
+            --output-dir build \
+            --export-binaries \
+            "$SKETCH_DIR"
+
+      - name: 🔍 Verify Compiled Binary
         shell: bash
         run: |
           set -euo pipefail
 
-          URL="https://github.com/stm32duino/BoardManagerFiles/raw/main/package_stmicroelectronics_index.json"
+          BIN_FILE="$(find build -type f -name '*.bin' -print -quit)"
+          if [ -z "$BIN_FILE" ]; then
+            echo "::error::No .bin output binary found."
+            exit 1
+          fi
 
-          arduino-cli config add board_manager.additional_urls "$URL"
+          cp "$BIN_FILE" build/STM32_Zipper_CNC_Production.bin
+          BIN_SIZE="$(stat -c%s build/STM32_Zipper_CNC_Production.bin)"
+          echo "Compiled binary size: $BIN_SIZE bytes ($((BIN_SIZE / 1024)) KB)"
 
-          arduino-cli config dump
+          python3 - <<'PY'
+          from pathlib import Path
 
-      - name: Update Arduino Package Indexes
+          path = Path("build/STM32_Zipper_CNC_Production.bin")
+          data = path.read_bytes()
+
+          if len(data) < 8:
+              raise SystemExit("ERROR: Binary is too small to contain an ARM vector table.")
+
+          sp = int.from_bytes(data[0:4], "little")
+          pc = int.from_bytes(data[4:8], "little")
+
+          print(f"Initial SP: {sp:#010x} | Reset PC: {pc:#010x}")
+
+          # STM32F103C8 SRAM is 20 KiB; the initial SP commonly points
+          # to the top of SRAM. Reset PC must point into flash and be Thumb.
+          sp_ok = 0x20000000 <= sp <= 0x20005000
+          pc_addr = pc & ~1
+          pc_ok = (pc & 1) == 1 and 0x08000000 <= pc_addr < 0x08010000
+
+          if not sp_ok or not pc_ok:
+              raise SystemExit("ERROR: ARM vector table bounds check failed.")
+
+          print("ARM vector table bounds check passed.")
+          PY
+
+      - name: 🚀 Upload Compiled Production Binary Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: STM32_Zipper_CNC_Production_Binary
+          path: build/STM32_Zipper_CNC_Production.bin
+          if-no-files-found: error
+          retention-days: 30
