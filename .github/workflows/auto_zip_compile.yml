@@ -1,1 +1,70 @@
+name: Upload ZIP - Build STM32 Firmware
 
+on:
+  push:
+    paths:
+      - 'STM32_Firmware.zip'
+      - '.github/workflows/auto_zip_compile.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Verify and extract firmware ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f STM32_Firmware.zip
+          mkdir -p firmware
+          unzip -q STM32_Firmware.zip -d firmware
+          test -f firmware/tests/run_tests.sh
+          test -n "$(find firmware -name '*.ino' -print -quit)"
+
+      - name: Run host regression tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash firmware/tests/run_tests.sh
+
+      - name: Set up Arduino CLI
+        uses: arduino/setup-arduino-cli@v2
+
+      - name: Install STM32 core and libraries
+        shell: bash
+        run: |
+          set -euo pipefail
+          arduino-cli core update-index
+          arduino-cli core install STMicroelectronics:stm32
+          arduino-cli lib install "LiquidCrystal I2C"
+
+      - name: Compile STM32F103C8T6 firmware
+        shell: bash
+        run: |
+          set -euo pipefail
+          SKETCH="$(find firmware -name '*.ino' -print -quit)"
+          test -n "$SKETCH"
+          SKETCH_DIR="$(dirname "$SKETCH")"
+          mkdir -p build
+          arduino-cli compile --verbose \
+            --fqbn 'STMicroelectronics:stm32:GenF1:pnum=BLUEPILL_F103C8' \
+            --output-dir build \
+            "$SKETCH_DIR"
+
+      - name: Upload compiled firmware artifacts
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: STM32-V17-firmware-build
+          path: |
+            build/**/*.bin
+            build/**/*.hex
+          if-no-files-found: warn
+          retention-days: 14
